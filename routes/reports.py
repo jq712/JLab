@@ -1,10 +1,10 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from sqlalchemy import func, desc
 from models.transaction import Transaction
 from models.category import Category, CategoryType
 from models.account import Account
 from models.bill import Bill
+from utils.database import db
 from datetime import datetime, date, timedelta
 import calendar
 
@@ -46,128 +46,149 @@ def spending_by_category():
     
     # Get all expense transactions (negative amounts) for the date range
     # Join with categories to filter by expense type
-    results = Transaction.query.join(
-        Category, Transaction.category_id == Category.id
-    ).filter(
-        Transaction.user_id == current_user_id,
-        Transaction.date.between(start_date, end_date),
-        Category.type == CategoryType.EXPENSE
-    ).with_entities(
-        Category.id,
-        Category.name,
-        Category.color,
-        func.abs(func.sum(Transaction.amount)).label('total')
-    ).group_by(
-        Category.id,
-        Category.name,
-        Category.color
-    ).order_by(
-        desc('total')
-    ).all()
+    query = """
+        SELECT c.id, c.name, c.color, ABS(SUM(t.amount)) as total
+        FROM transactions t
+        JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = %s
+        AND t.date BETWEEN %s AND %s
+        AND c.type = %s
+        AND t.amount < 0
+        GROUP BY c.id, c.name, c.color
+        ORDER BY total DESC
+    """
     
+    results = db.fetch_all(
+        query, 
+        (current_user_id, start_date.isoformat(), end_date.isoformat(), CategoryType.EXPENSE.value)
+    )
+    
+    # Calculate total spending
+    total_spending = sum(item['total'] for item in results)
+    
+    # Format response
     categories = []
-    total_spending = 0
-    
-    for result in results:
-        category = {
-            'id': result.id,
-            'name': result.name,
-            'color': result.color,
-            'total': float(result.total)
-        }
-        total_spending += float(result.total)
-        categories.append(category)
+    for item in results:
+        categories.append({
+            'id': item['id'],
+            'name': item['name'],
+            'color': item['color'],
+            'amount': float(item['total']),
+            'percentage': round((float(item['total']) / total_spending * 100), 2) if total_spending > 0 else 0
+        })
     
     return jsonify({
         'start_date': start_date.isoformat(),
         'end_date': end_date.isoformat(),
-        'categories': categories,
-        'total_spending': total_spending
+        'total': float(total_spending),
+        'categories': categories
     }), 200
 
 @reports_bp.route('/income-vs-expenses', methods=['GET'])
 @jwt_required()
 def income_vs_expenses():
-    """Get income versus expenses comparison for a given date range"""
+    """Get income vs expenses summary for a given date range"""
     current_user_id = get_jwt_identity()
     start_date, end_date = get_date_range_from_params()
     
-    # Get summary by category type (income vs expense)
-    results = Transaction.query.join(
-        Category, Transaction.category_id == Category.id
-    ).filter(
-        Transaction.user_id == current_user_id,
-        Transaction.date.between(start_date, end_date)
-    ).with_entities(
-        Category.type,
-        func.sum(Transaction.amount).label('total')
-    ).group_by(
-        Category.type
-    ).all()
+    # Get income (positive amounts)
+    income_query = """
+        SELECT SUM(t.amount) as total
+        FROM transactions t
+        JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = %s
+        AND t.date BETWEEN %s AND %s
+        AND c.type = %s
+        AND t.amount > 0
+    """
     
-    income = 0
-    expenses = 0
+    income_result = db.fetch_one(
+        income_query, 
+        (current_user_id, start_date.isoformat(), end_date.isoformat(), CategoryType.INCOME.value)
+    )
     
-    for result in results:
-        if result.type == CategoryType.INCOME:
-            income = float(result.total)
-        elif result.type == CategoryType.EXPENSE:
-            expenses = float(abs(result.total))
+    # Get expenses (negative amounts, but we'll make them positive for display)
+    expense_query = """
+        SELECT ABS(SUM(t.amount)) as total
+        FROM transactions t
+        JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = %s
+        AND t.date BETWEEN %s AND %s
+        AND c.type = %s
+        AND t.amount < 0
+    """
     
-    net = income - expenses
+    expense_result = db.fetch_one(
+        expense_query, 
+        (current_user_id, start_date.isoformat(), end_date.isoformat(), CategoryType.EXPENSE.value)
+    )
+    
+    # Calculate totals and net
+    total_income = float(income_result['total'] if income_result and income_result['total'] else 0)
+    total_expenses = float(expense_result['total'] if expense_result and expense_result['total'] else 0)
+    net = total_income - total_expenses
     
     return jsonify({
         'start_date': start_date.isoformat(),
         'end_date': end_date.isoformat(),
-        'income': income,
-        'expenses': expenses,
+        'income': total_income,
+        'expenses': total_expenses,
         'net': net
     }), 200
 
 @reports_bp.route('/account-balances', methods=['GET'])
 @jwt_required()
 def account_balances():
-    """Get summary of all account balances"""
+    """Get current account balances"""
     current_user_id = get_jwt_identity()
     
     # Get all active accounts
-    accounts = Account.query.filter_by(
-        user_id=current_user_id,
-        is_active=1
-    ).all()
+    accounts = Account.get_active_by_user_id(current_user_id)
     
-    # Separate accounts by type
-    account_groups = {}
-    total_balances = {}
-    total_net_worth = 0
+    # Format response
+    account_balances = []
+    total_balance = 0
     
     for account in accounts:
-        account_type = account.account_type.value
-        if account_type not in account_groups:
-            account_groups[account_type] = []
-            total_balances[account_type] = 0
-        
-        account_data = {
+        balance = float(account.balance) if hasattr(account, 'balance') else 0
+        account_balances.append({
             'id': account.id,
             'name': account.name,
-            'balance': account.balance,
-            'currency': account.currency,
-            'institution': account.institution
-        }
-        
-        account_groups[account_type].append(account_data)
-        total_balances[account_type] += account.balance
-        
-        # For net worth calculation (credit card balances are negative)
-        if account_type == 'credit_card':
-            total_net_worth -= account.balance
-        else:
-            total_net_worth += account.balance
+            'type': account.account_type,
+            'balance': balance,
+            'currency': account.currency
+        })
+        total_balance += balance
+    
+    # Get recent transactions
+    recent_query = """
+        SELECT t.id, t.date, t.description, t.amount, a.name as account_name, c.name as category_name
+        FROM transactions t
+        JOIN accounts a ON t.account_id = a.id
+        JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = %s
+        ORDER BY t.date DESC
+        LIMIT 5
+    """
+    
+    recent_transactions = db.fetch_all(recent_query, (current_user_id,))
+    
+    # Format recent transactions
+    recent = []
+    for tx in recent_transactions:
+        recent.append({
+            'id': tx['id'],
+            'date': tx['date'].isoformat() if isinstance(tx['date'], date) else tx['date'],
+            'description': tx['description'],
+            'amount': float(tx['amount']),
+            'account_name': tx['account_name'],
+            'category_name': tx['category_name']
+        })
     
     return jsonify({
-        'account_groups': account_groups,
-        'total_balances': total_balances,
-        'total_net_worth': total_net_worth
+        'total_balance': total_balance,
+        'accounts': account_balances,
+        'recent_transactions': recent
     }), 200
 
 @reports_bp.route('/bill-summary', methods=['GET'])
@@ -176,143 +197,171 @@ def bill_summary():
     """Get summary of upcoming bills"""
     current_user_id = get_jwt_identity()
     
-    # Get current date and date 30 days in future
+    # Get upcoming bills (due in the next 30 days)
     today = date.today()
     end_date = today + timedelta(days=30)
     
-    # Get all unpaid bills due in the next 30 days
-    upcoming_bills = Bill.query.filter(
-        Bill.user_id == current_user_id,
-        Bill.is_paid == False,
-        Bill.due_date.between(today, end_date)
-    ).order_by(
-        Bill.due_date
-    ).all()
+    upcoming_query = """
+        SELECT b.id, b.name, b.amount, b.due_date, b.frequency, b.is_paid,
+               c.name as category_name, a.name as account_name
+        FROM bills b
+        LEFT JOIN categories c ON b.category_id = c.id
+        LEFT JOIN accounts a ON b.account_id = a.id
+        WHERE b.user_id = %s
+        AND b.due_date BETWEEN %s AND %s
+        ORDER BY b.due_date ASC
+    """
     
-    # Calculate total amount due
-    total_due = sum(bill.amount for bill in upcoming_bills)
-    
-    bills_data = []
-    for bill in upcoming_bills:
-        days_until_due = (bill.due_date - today).days
-        bills_data.append({
-            'id': bill.id,
-            'name': bill.name,
-            'amount': bill.amount,
-            'due_date': bill.due_date.isoformat(),
-            'days_until_due': days_until_due,
-            'category_id': bill.category_id
-        })
+    upcoming_bills = db.fetch_all(
+        upcoming_query, 
+        (current_user_id, today.isoformat(), end_date.isoformat())
+    )
     
     # Get overdue bills
-    overdue_bills = Bill.query.filter(
-        Bill.user_id == current_user_id,
-        Bill.is_paid == False,
-        Bill.due_date < today
-    ).order_by(
-        Bill.due_date
-    ).all()
+    overdue_query = """
+        SELECT b.id, b.name, b.amount, b.due_date, b.frequency, b.is_paid,
+               c.name as category_name, a.name as account_name
+        FROM bills b
+        LEFT JOIN categories c ON b.category_id = c.id
+        LEFT JOIN accounts a ON b.account_id = a.id
+        WHERE b.user_id = %s
+        AND b.due_date < %s
+        AND b.is_paid = 0
+        ORDER BY b.due_date ASC
+    """
     
-    overdue_data = []
-    overdue_total = 0
-    for bill in overdue_bills:
-        days_overdue = (today - bill.due_date).days
-        overdue_data.append({
-            'id': bill.id,
-            'name': bill.name,
-            'amount': bill.amount,
-            'due_date': bill.due_date.isoformat(),
-            'days_overdue': days_overdue,
-            'category_id': bill.category_id
+    overdue_bills = db.fetch_all(overdue_query, (current_user_id, today.isoformat()))
+    
+    # Format response
+    upcoming = []
+    for bill in upcoming_bills:
+        upcoming.append({
+            'id': bill['id'],
+            'name': bill['name'],
+            'amount': float(bill['amount']),
+            'due_date': bill['due_date'].isoformat() if isinstance(bill['due_date'], date) else bill['due_date'],
+            'frequency': bill['frequency'],
+            'is_paid': bool(bill['is_paid']),
+            'category_name': bill['category_name'],
+            'account_name': bill['account_name']
         })
-        overdue_total += bill.amount
+    
+    overdue = []
+    for bill in overdue_bills:
+        overdue.append({
+            'id': bill['id'],
+            'name': bill['name'],
+            'amount': float(bill['amount']),
+            'due_date': bill['due_date'].isoformat() if isinstance(bill['due_date'], date) else bill['due_date'],
+            'frequency': bill['frequency'],
+            'is_paid': bool(bill['is_paid']),
+            'category_name': bill['category_name'],
+            'account_name': bill['account_name']
+        })
+    
+    # Calculate totals
+    total_upcoming = sum(bill['amount'] for bill in upcoming)
+    total_overdue = sum(bill['amount'] for bill in overdue)
     
     return jsonify({
-        'upcoming_bills': bills_data,
-        'upcoming_total': total_due,
-        'overdue_bills': overdue_data,
-        'overdue_total': overdue_total
+        'upcoming_bills': upcoming,
+        'overdue_bills': overdue,
+        'total_upcoming': float(total_upcoming),
+        'total_overdue': float(total_overdue)
     }), 200
 
 @reports_bp.route('/monthly-trend', methods=['GET'])
 @jwt_required()
 def monthly_trend():
-    """Get monthly income and expense trends"""
+    """Get monthly income and expense trends for the past 6 months"""
     current_user_id = get_jwt_identity()
     
-    # Get number of months to look back (default 6)
-    try:
-        months = int(request.args.get('months', 6))
-        if months < 1:
-            months = 6
-    except ValueError:
-        months = 6
+    # Calculate date range (past 6 months)
+    end_date = date.today()
+    start_date = date(end_date.year - 1 if end_date.month <= 6 else end_date.year, 
+                     (end_date.month - 6) % 12 + 1, 1)
     
-    today = date.today()
-    start_month = today.month - months
-    start_year = today.year
+    # Get monthly income
+    income_query = """
+        SELECT 
+            YEAR(t.date) as year,
+            MONTH(t.date) as month,
+            SUM(t.amount) as total
+        FROM transactions t
+        JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = %s
+        AND t.date BETWEEN %s AND %s
+        AND c.type = %s
+        AND t.amount > 0
+        GROUP BY YEAR(t.date), MONTH(t.date)
+        ORDER BY YEAR(t.date), MONTH(t.date)
+    """
     
-    # Adjust year if needed
-    while start_month <= 0:
-        start_month += 12
-        start_year -= 1
+    income_results = db.fetch_all(
+        income_query, 
+        (current_user_id, start_date.isoformat(), end_date.isoformat(), CategoryType.INCOME.value)
+    )
     
-    start_date = date(start_year, start_month, 1)
+    # Get monthly expenses
+    expense_query = """
+        SELECT 
+            YEAR(t.date) as year,
+            MONTH(t.date) as month,
+            ABS(SUM(t.amount)) as total
+        FROM transactions t
+        JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = %s
+        AND t.date BETWEEN %s AND %s
+        AND c.type = %s
+        AND t.amount < 0
+        GROUP BY YEAR(t.date), MONTH(t.date)
+        ORDER BY YEAR(t.date), MONTH(t.date)
+    """
     
-    # Get monthly income and expense totals
-    monthly_data = []
+    expense_results = db.fetch_all(
+        expense_query, 
+        (current_user_id, start_date.isoformat(), end_date.isoformat(), CategoryType.EXPENSE.value)
+    )
     
-    current_date = start_date
-    while current_date <= today:
-        month_name = current_date.strftime('%B %Y')
-        month_start = date(current_date.year, current_date.month, 1)
-        month_end = date(
-            current_date.year, current_date.month, 
-            calendar.monthrange(current_date.year, current_date.month)[1]
-        )
-        
-        # Get income for month
-        income_result = Transaction.query.join(
-            Category, Transaction.category_id == Category.id
-        ).filter(
-            Transaction.user_id == current_user_id,
-            Transaction.date.between(month_start, month_end),
-            Category.type == CategoryType.INCOME
-        ).with_entities(
-            func.sum(Transaction.amount).label('total')
-        ).first()
-        
-        income = float(income_result.total) if income_result.total else 0
-        
-        # Get expenses for month
-        expense_result = Transaction.query.join(
-            Category, Transaction.category_id == Category.id
-        ).filter(
-            Transaction.user_id == current_user_id,
-            Transaction.date.between(month_start, month_end),
-            Category.type == CategoryType.EXPENSE
-        ).with_entities(
-            func.sum(Transaction.amount).label('total')
-        ).first()
-        
-        expenses = float(abs(expense_result.total)) if expense_result.total else 0
-        
-        monthly_data.append({
-            'month': month_name,
-            'income': income,
-            'expenses': expenses,
-            'net': income - expenses
-        })
-        
+    # Create a dictionary of months for easy lookup
+    months = {}
+    current = start_date
+    while current <= end_date:
+        month_key = f"{current.year}-{current.month:02d}"
+        months[month_key] = {
+            'year': current.year,
+            'month': current.month,
+            'month_name': current.strftime('%b %Y'),
+            'income': 0,
+            'expenses': 0,
+            'net': 0
+        }
         # Move to next month
-        month = current_date.month + 1
-        year = current_date.year
-        if month > 12:
-            month = 1
-            year += 1
-        
-        current_date = date(year, month, 1)
+        if current.month == 12:
+            current = date(current.year + 1, 1, 1)
+        else:
+            current = date(current.year, current.month + 1, 1)
+    
+    # Fill in income data
+    for item in income_results:
+        month_key = f"{item['year']}-{item['month']:02d}"
+        if month_key in months:
+            months[month_key]['income'] = float(item['total'])
+    
+    # Fill in expense data
+    for item in expense_results:
+        month_key = f"{item['year']}-{item['month']:02d}"
+        if month_key in months:
+            months[month_key]['expenses'] = float(item['total'])
+    
+    # Calculate net for each month
+    for month_key in months:
+        months[month_key]['net'] = months[month_key]['income'] - months[month_key]['expenses']
+    
+    # Convert to list and sort by date
+    trend_data = list(months.values())
+    trend_data.sort(key=lambda x: (x['year'], x['month']))
     
     return jsonify({
-        'monthly_trend': monthly_data
+        'trend_data': trend_data
     }), 200 

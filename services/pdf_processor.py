@@ -238,9 +238,11 @@ class PDFProcessor:
     @staticmethod
     def process_statement(pdf_statement_id, db):
         """Static method to process a statement by ID"""
-        statement = db.session.query(PDFStatement).get(pdf_statement_id)
+        from models.pdf_statement import PDFStatement
+        
+        statement = PDFStatement.get_by_id(pdf_statement_id)
         if not statement:
-            raise ValueError(f"Statement with ID {pdf_statement_id} not found")
+            return False
         
         processor = PDFProcessor(statement)
         return processor.process() 

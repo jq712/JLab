@@ -1,11 +1,24 @@
 import os
-from flask import Flask
+from flask import Flask, g
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
-from flask_migrate import Migrate
 from config import get_config
-from models import db
+from utils import db
 from routes import register_routes
+
+
+def get_db():
+    """Get database connection"""
+    if 'db' not in g:
+        g.db = db.get_connection(current_app.config)
+    return g.db
+
+
+def close_db(e=None):
+    """Close database connection"""
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
 
 
 def create_app(config_name='development'):
@@ -18,14 +31,11 @@ def create_app(config_name='development'):
     # Enable CORS
     CORS(app)
     
-    # Initialize database
-    db.init_app(app)
-    
-    # Initialize migrations
-    migrate = Migrate(app, db)
-    
     # Initialize JWT
     jwt = JWTManager(app)
+    
+    # Register database connection handlers
+    app.teardown_appcontext(close_db)
     
     # Create upload folder if it doesn't exist
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)

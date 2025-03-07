@@ -1,11 +1,20 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from models.account import Account, AccountType
 from marshmallow import Schema, fields, validate, ValidationError
+from utils import db
 import enum
 
 # Create blueprint
 accounts_bp = Blueprint('accounts', __name__)
+
+# Account types enum
+class AccountType(enum.Enum):
+    CHECKING = "checking"
+    SAVINGS = "savings"
+    CREDIT_CARD = "credit_card"
+    CASH = "cash"
+    INVESTMENT = "investment"
+    OTHER = "other"
 
 # Input validation schemas
 class AccountSchema(Schema):
@@ -22,30 +31,38 @@ class AccountSchema(Schema):
 def get_all_accounts():
     """Get all accounts for the current user"""
     current_user_id = get_jwt_identity()
+    conn = g.db
     
-    accounts = Account.query.filter_by(user_id=current_user_id, is_active=1).all()
+    query = """
+        SELECT * FROM accounts 
+        WHERE user_id = %s AND is_active = 1
+        ORDER BY name
+    """
+    accounts = db.fetch_all(conn, query, (current_user_id,))
     
-    return jsonify({
-        "accounts": [account.to_dict() for account in accounts]
-    }), 200
+    return jsonify({"accounts": accounts}), 200
 
 @accounts_bp.route('/<int:account_id>', methods=['GET'])
 @jwt_required()
 def get_account(account_id):
     """Get a specific account by ID"""
     current_user_id = get_jwt_identity()
+    conn = g.db
     
-    account = Account.query.filter_by(id=account_id, user_id=current_user_id).first()
+    query = "SELECT * FROM accounts WHERE id = %s AND user_id = %s"
+    account = db.fetch_one(conn, query, (account_id, current_user_id))
+    
     if not account:
         return jsonify({"message": "Account not found"}), 404
     
-    return jsonify({"account": account.to_dict()}), 200
+    return jsonify({"account": account}), 200
 
 @accounts_bp.route('/', methods=['POST'])
 @jwt_required()
 def create_account():
     """Create a new financial account"""
     current_user_id = get_jwt_identity()
+    conn = g.db
     
     # Validate input data
     schema = AccountSchema()
@@ -54,28 +71,39 @@ def create_account():
     except ValidationError as err:
         return jsonify({"message": "Validation error", "errors": err.messages}), 400
     
-    # Map string account type to enum
+    # Map string account type to enum to validate
     try:
-        account_type = AccountType(data['account_type'])
+        AccountType(data['account_type'])
     except ValueError:
         return jsonify({"message": "Invalid account type"}), 400
     
     # Create new account
     try:
-        account = Account(
-            name=data['name'],
-            account_type=account_type,
-            user_id=current_user_id,
-            balance=data.get('balance', 0.0),
-            currency=data.get('currency', 'USD'),
-            description=data.get('description'),
-            institution=data.get('institution')
+        query = """
+            INSERT INTO accounts (
+                name, type, balance, currency, description, 
+                institution, is_active, user_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        params = (
+            data['name'],
+            data['account_type'],
+            data.get('balance', 0.0),
+            data.get('currency', 'USD'),
+            data.get('description'),
+            data.get('institution'),
+            True,
+            current_user_id
         )
-        account.save()
+        db.execute_with_commit(conn, query, params)
+        
+        # Get the newly created account
+        query = "SELECT * FROM accounts WHERE user_id = %s ORDER BY id DESC LIMIT 1"
+        account = db.fetch_one(conn, query, (current_user_id,))
         
         return jsonify({
             "message": "Account created successfully",
-            "account": account.to_dict()
+            "account": account
         }), 201
         
     except Exception as e:
@@ -86,9 +114,11 @@ def create_account():
 def update_account(account_id):
     """Update an existing account"""
     current_user_id = get_jwt_identity()
+    conn = g.db
     
     # Check if account exists and belongs to user
-    account = Account.query.filter_by(id=account_id, user_id=current_user_id).first()
+    check_query = "SELECT id FROM accounts WHERE id = %s AND user_id = %s"
+    account = db.fetch_one(conn, check_query, (account_id, current_user_id))
     if not account:
         return jsonify({"message": "Account not found"}), 404
     
@@ -99,29 +129,42 @@ def update_account(account_id):
     except ValidationError as err:
         return jsonify({"message": "Validation error", "errors": err.messages}), 400
     
-    # Update account fields
-    if 'name' in data:
-        account.name = data['name']
+    # Validate account type if provided
     if 'account_type' in data:
         try:
-            account.account_type = AccountType(data['account_type'])
+            AccountType(data['account_type'])
         except ValueError:
             return jsonify({"message": "Invalid account type"}), 400
-    if 'currency' in data:
-        account.currency = data['currency']
-    if 'description' in data:
-        account.description = data['description']
-    if 'institution' in data:
-        account.institution = data['institution']
     
-    # Note: We intentionally don't allow direct balance update here
-    # Balance should only be updated through transactions
+    # Build update query dynamically based on provided fields
+    update_fields = []
+    params = []
+    for field in ['name', 'account_type', 'currency', 'description', 'institution']:
+        if field in data:
+            update_fields.append(f"{field if field != 'account_type' else 'type'} = %s")
+            params.append(data[field])
     
-    account.save()
+    if not update_fields:
+        return jsonify({"message": "No fields to update"}), 400
+    
+    # Add account_id and user_id to params
+    params.extend([account_id, current_user_id])
+    
+    # Update account
+    query = f"""
+        UPDATE accounts 
+        SET {', '.join(update_fields)}
+        WHERE id = %s AND user_id = %s
+    """
+    db.execute_with_commit(conn, query, params)
+    
+    # Get updated account
+    query = "SELECT * FROM accounts WHERE id = %s"
+    updated_account = db.fetch_one(conn, query, (account_id,))
     
     return jsonify({
         "message": "Account updated successfully",
-        "account": account.to_dict()
+        "account": updated_account
     }), 200
 
 @accounts_bp.route('/<int:account_id>', methods=['DELETE'])
@@ -129,14 +172,16 @@ def update_account(account_id):
 def delete_account(account_id):
     """Soft delete an account (mark as inactive)"""
     current_user_id = get_jwt_identity()
+    conn = g.db
     
     # Check if account exists and belongs to user
-    account = Account.query.filter_by(id=account_id, user_id=current_user_id).first()
+    check_query = "SELECT id FROM accounts WHERE id = %s AND user_id = %s"
+    account = db.fetch_one(conn, check_query, (account_id, current_user_id))
     if not account:
         return jsonify({"message": "Account not found"}), 404
     
     # Soft delete (mark as inactive)
-    account.is_active = 0
-    account.save()
+    query = "UPDATE accounts SET is_active = 0 WHERE id = %s AND user_id = %s"
+    db.execute_with_commit(conn, query, (account_id, current_user_id))
     
     return jsonify({"message": "Account deleted successfully"}), 200 

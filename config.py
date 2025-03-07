@@ -13,8 +13,7 @@ class Config:
     TESTING = False
     
     # Database configurations
-    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URI')
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    DATABASE_URI = os.getenv('DATABASE_URI')
     
     # JWT configurations
     JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'dev-jwt-secret')
@@ -33,14 +32,14 @@ class Config:
 class DevelopmentConfig(Config):
     """Development configuration"""
     DEBUG = True
-    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URI', 'mysql+pymysql://root:password@localhost/finance_db')
+    DATABASE_URI = os.getenv('DATABASE_URI', 'mysql+pymysql://root:password@localhost/finance_db')
 
 
 class TestingConfig(Config):
     """Testing configuration"""
     TESTING = True
     DEBUG = True
-    SQLALCHEMY_DATABASE_URI = os.getenv('TEST_DATABASE_URI', 'mysql+pymysql://root:password@localhost/finance_test_db')
+    DATABASE_URI = os.getenv('TEST_DATABASE_URI', 'mysql+pymysql://root:password@localhost/finance_test_db')
     
 
 class ProductionConfig(Config):
@@ -49,7 +48,7 @@ class ProductionConfig(Config):
     # In production, make sure these are securely set in the environment
     SECRET_KEY = os.getenv('SECRET_KEY')
     JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY')
-    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URI')
+    DATABASE_URI = os.getenv('DATABASE_URI')
 
 
 # Configuration dictionary to easily access different configurations
